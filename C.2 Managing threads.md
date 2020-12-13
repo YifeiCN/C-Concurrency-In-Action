@@ -35,6 +35,143 @@ identifying particular threads
 同我们的程序在`main()`中return就会exit一样，当我们启动的其他线程return，这个线程就exit了。
 
 
+## 2.4 Choosing the number of  threads at runtimes
+
+一个比较有用的库函数是`std::thread::hardware_concurrency()`，这个函数能够返回一个程序能真正并行的线程数，它可能是服务器的CPU的逻辑核数。
+
+下面代码展示了一个并行版本的`std::accumulate`，它将任务分成了几个线程，每个线程都设定了最小的处理元素数目，以防止开启太多线程造成的开销。注意，下面的代码我们假设不会抛出异常，尽管有可能会抛出线程（比如说，一个`std::thread`的构造函数不能开始一个新的执行线程），代码如下：
+
+```c++
+// A naive parallel version of std::accumulate
+template<typename Iterator, typename T>
+struct accumulate_block
+{
+    void operator()(Iterator first, Iterator last, T& result)
+    {
+        result = std::accumulate(first, last, result);
+    }
+}
+
+template<typename Iteratorr, typename T>
+T parallel_accumulate(Iterator first, Iterator last, T init)
+{
+    unsigned long const length = std::distance(first, last);
+    
+    if(!length)																		  // 1
+        return init;
+    
+    unsigned long const min_per_thread = 25;
+    unsigned long const max_threads = (length + min_per_thread -1)/min_per_thread;			// 2
+    
+    unsigned long const hardware_threads = 
+        std::thread::hardware_concurrency();
+    
+    unsigned long const num_threads =												// 3
+        std::min(hardware_threads!=0 ? hardware_treads : 2, max_threads );
+    
+    unsigned long const block_size = lenght/num_threads;								  // 4
+    
+    std::vector<T> results(num_threads);
+    std::vector<std::thread> threads(num_threads-1);									// 5
+    
+    Iterator block_start = first;
+    for(unsigned long i = 0; i<(num_threads-1); ++i)
+    {
+        Iterator block_end=block_start;
+        std::advance(block_end, block_size);											// 6
+        threads[i] = std::thread(accumulate_block<Iterator,T>(), block_start, block_end, std::ref(results[i]));		// 7
+        block_start = block_end;														// 8
+    }
+    accumulate_block<Iterator,T>()(
+    	block_start, last, results[num_threads-1]);										// 9
+    std::for_each(threads.begin(), threads.end(), std::men_fn(&std::thread::join));			// 10
+    
+    return std::accumulate(results.begin(), results.end(), init);						// 11
+}
+```
+
+代码1 处，如果输入的为空，那么就返回初始值`init`。否则，就至少有一个元素。
+
+在代码2处，可以将元素分给不同的线程去处理，设定了每个线程要处理的最少元素个数，那我们给每个线程**最少**分这些个数的元素处理，就一共**最多**需要(length + min_per_thread -1)/min_per_thread个线程（PS:有一个线程可能处理的元素数不足min_per_thread，其他的线程都处理min_per_thread个元素，所以计算公式是这样）。这样可以避免处理很少的数据的时候却开启了逻辑CPU数量个线程（这导致了额外的非必要开销，根本不需要那么多线程）。
+
+代码3处，我们选择我们需要的线程数量，它是我们机器可以支持的最大真并行线程数（逻辑CPU数）和我们所需的最大线程数之间的**最小者**。我们不希望在面对计算型任务的时候，使用超过逻辑CPU数量个数的线程，因为那会导致频繁的线程切换，从而导致不必要的**上下文切换**开销。
+
+在代码4处，我们计算了每个线程要处理的元素的个数。需要注意，这个地方使用了int间的除法，会有舍入误差，因此在后面我们用一个单独的线程去处理那些**元素被均匀地派发给其他每个线程后还剩余的元素**。（这里需要重新计算的原因是，我们上一步才确定了真正要用的线程的个数）。
+
+在代码5处，需要注意，我们要开启num_threads-1个线程，因为我们已经有一个线程了（也就是当前这个在执行的线程，后面可以看出，当前这个线程用来处理剩余元素）。
+
+只需要一个简单的for loop去开启这些线程，在代码6处，`std::advance(block_end, block_size)`的作用是，将迭代器`block_end`向后移动`block_size`个位置，也就是将迭代器`block_end`移动到了当前要处理的块的**尾后**（同时这个位置也是块要处理的开始）。
+
+然后代码7处，新开启了一个线程对这个块进行了计算（PS：给这个线程对象传的第一个参数是`accumulate_block<Iterator,T>()`，是一个`accumulate_block`临时对象，是个右值，然后这个对象有个`operator()`，可以call）。另外还用了我们前面说过的引用 `std::ref(results[i])`，直接在`results[]`上更新结果。
+
+代码8，下一个线程的开始的迭代器位置是当前线程的尾后迭代器。
+
+在代码9处，我们**在当前线程**处理剩下的所有的没有被计算的元素。我们知道结束的地方是`last`。
+
+当算完最后这个块的时候，我们可以通过`std::for_each`来等待所有线程完成（代码10）。
+
+最后将每个线程计算的结果再通过`std::accumulate`累加起来。
+
+
+
+**需要注意的是，我们没有办法直接从一个线程里直接返回一个值**，所以，我们需要传递一个引用，来进行数据的交互。
+
+另外，第四章将要讲到的**futures**可以提供一种从线程返回值的方法。
+
+
+
+在上面我们讲到这个例子中，在线程开始的时候，我们就把线程所需要的所有的东西都传进去了，包括它用来返回结果的那个`result`。
+
+但是事实并不总是如此，有时候，我们需要在执行的过程中识别线程。我们可以像代码2.7那样传一个`i`作为标识符来标识线程，**但是**，如果一个函数在很多层的调用栈里需要一个标识符，并且任何线程都能call到它，那么用刚刚说的这种方式就不是很方便了，所以接下来要介绍的东西就是C++线程库里为我们提供的一种对给个线程的独一无二的标识符。
+
+## 2.5 Indentifying threads
+
+线程标识符的类型是`std::thread::id`，并且可以通过两种方式得到：
+
+1. 一个线程的标识符，可以通过call这个线程相关联的那个`std::thread`对象的成员函数`get_id()`来得到。如果一个`std::thread`对象没有相关联的执行线程，那么在这个对象上call `get_id()`会返回一个默认构造的`std::thread::id`对象，这代表“没有任何线程”。
+2. 当前线程的id可以通过call `std::this_thread::get_id()`来获得。
+
+它们都包含在在\<thread\>头文件里。
+
+`std::thread::id`类型的对象可以拷贝和比较，否则它们作为标识符的意义就不大了。
+
+如果两个线程标识符相等，那么意味着它们代表同一个线程，或者都表示，没有任何执行线程。
+
+如果两个标识符不同，那么意味着它们不是同一个线程，或者其中一个没有任何执行线程，而另一个有一个执行线程。
+
+线程库不限制我们对于线程标识符是否相同的检查，并且线程标识符对象支持比较操作运算符，这就意味着，我们可以用线程标识符作为key来与容器关联，或者进行排序，或者比较等等，来方便我们编程。
+
+`std::thread::id`实例常用来检查线程是否需要执行一些操作。
+
+比如，在前面的代码2.8中，开启其他线程的原始线程的行为可能会有变化，原始线程在启动其他线程之前需要通过`std::this_thread::get_id()`先保存那个要启动的线程的id，然后在运行的时候通过检查线程id来区分线程是做哪个工作，如下所示
+
+```c++
+std::thread::id master_thread;
+void some_core_patr_of_algorithm()
+{
+	if(std::this_thread::get_id()==master_thread)
+    {
+        do_master_thread_work();
+    }
+    do_common_work();
+}
+```
+
+
+
+## 2.6 Summary
+
+本章介绍了C++ 线程库 对线程提供的基本操作的支持：启动线程，等待线程运行完毕，不等线程运行完（因为将其放到后台去了）。
+
+同时我们也介绍了在线程启动的时候，如何将对执行线程启动的函数进行传参，如何改变执行线程的拥有权，如何创建一堆线程并给他们分配任务以加速程序，最后还介绍了标识线程的方法，标识线程可以使我们有方法让特定的线程执行特定的功能或者处理特殊的数据。
+
+虽然在代码2.8中我们介绍了让不同线程独立处理不同数据的方法，但是有时我们需要在线程运行时**共享数据**。
+
+第三章主要围绕对线程间直接共享数据的讨论展开。
+
+第四章则讨论了不通过共享数据 来实现同步的操作的一般性问题。
+
+
 
 那么我们该如何启动一个`std::thread`线程呢？
 
